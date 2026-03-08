@@ -1,50 +1,59 @@
 # scicomp-accelerators
 
-Exploring classical PDE solvers on modern ML hardware — benchmarking numerical methods for the 1D heat equation across CPU, GPU, and TPU using PyTorch and JAX.
+I trained as a chemical engineer, spent years building physics-based simulation models for manufacturing processes, and eventually found myself deep in the world of ML hardware — optimizing LLM inference on Amazon's custom AI chips (Trainium). These feel like separate careers. This repo is my attempt to connect them.
+
+The question I keep coming back to: *what does it look like to run classical numerical simulation on the same hardware that powers modern AI?* GPU and TPU architectures were designed for the dense matrix operations at the heart of deep learning — but those same operations are exactly what PDE solvers need. This repo explores that overlap, using the 1D heat equation as a concrete testbed.
+
+This is exploratory work. The point isn't to produce a production solver — it's to understand the performance landscape and build intuition for where ML accelerators help, where they don't, and why.
 
 ---
 
 ## Notebooks
 
-### 1. `heat_equation_pytorch.ipynb` — Crank-Nicolson with PyTorch
-Implements the 1D heat equation from first principles using finite difference discretization and the Crank-Nicolson implicit time-stepping scheme with Neumann (zero-flux) boundary conditions.
+### 1. `heat_equation_pytorch.ipynb` — Crank-Nicolson solver with PyTorch
 
-- Derives and builds the tridiagonal system `A·u^{n+1} = B·u^n`
-- Verifies physical correctness: heat conservation to numerical precision
+A from-scratch implementation of the heat equation using finite difference discretization and the Crank-Nicolson implicit time-stepping scheme — the same class of methods I used professionally for years, now expressed in PyTorch instead of Fortran.
+
+- Derives and builds the tridiagonal system `A·u^{n+1} = B·u^n` with Neumann (zero-flux) boundary conditions
+- Verifies physical correctness: heat conservation to numerical precision across 500 time steps
 - Tests multiple initial conditions: Gaussian pulse, step function, sinusoidal
 - Benchmarks NumPy vs PyTorch CPU vs NVIDIA GPU (Tesla T4)
 
 **Results:**
-| Method | Time |
-|---|---|
-| NumPy | 9317 ms |
-| PyTorch CPU | 4601 ms |
-| PyTorch GPU | 2006 ms (**4.65x** over NumPy) |
+| Backend | Time | Speedup |
+|---|---|---|
+| NumPy | 9,317 ms | baseline |
+| PyTorch CPU | 4,601 ms | 2x |
+| PyTorch GPU | 2,006 ms | **4.65x** |
+
+The GPU advantage here is modest — the bottleneck is LU factorization, which is harder to parallelize than a pure matmul. A recurring theme in this repo.
 
 ---
 
-### 2. `heat_equation_ftcs_vs_crank_nicolson.ipynb` — Explicit vs Implicit on CPU/GPU
-Systematic comparison of two solver strategies on the same problem:
+### 2. `heat_equation_ftcs_vs_crank_nicolson.ipynb` — Explicit vs Implicit across CPU and GPU
 
-- **Explicit FTCS** (Forward Time Central Space): simple, fast per step, conditionally stable (CFL constraint)
-- **Crank-Nicolson**: unconditionally stable, allows larger time steps, requires a linear solve per step
+Compares two fundamentally different time-stepping strategies on the same physical problem:
 
-**Results (1000 pts, 2773 steps):**
+- **Explicit FTCS** (Forward Time Central Space): simple, cheap per step, but constrained by the CFL stability condition — requires small time steps
+- **Crank-Nicolson**: unconditionally stable, allows larger time steps, but requires solving a linear system at every step
+
+This trade-off is familiar to anyone who has worked with simulation solvers — and the GPU benchmark reveals *why* it matters for hardware choice.
+
+**Results (1000 spatial points, 2773 time steps):**
 | Method | CPU | GPU | GPU Speedup |
 |---|---|---|---|
 | Crank-Nicolson | 56,152 ms | 27,406 ms | 2.1x |
 | Explicit FTCS | 1,033 ms | 106 ms | **9.7x** |
 
-Explicit methods parallelize extremely well on GPU — each step is a pure matrix multiply. Implicit methods solve a linear system every step, which is harder to parallelize, explaining the modest GPU gain.
+Explicit methods are a near-perfect fit for GPU: each step is a pure matrix-vector multiply, massively parallelizable. Implicit methods require a linear solve per step — sequential by nature, and the GPU gives much less leverage. The choice of numerical method isn't just about accuracy and stability; it determines how well your solver maps to the hardware.
 
 ---
 
 ### 3. `heat_equation_jax_tpu.ipynb` — JAX with lax.scan on TPU
-Re-implements the same solvers in JAX targeting Google TPU. Key focus: `jax.lax.scan` as the correct way to compile iterative loops for accelerators.
 
-- `jax.jit` + `lax.scan` compiles the loop body once into an XLA `while` op — no Python overhead, no graph unrolling
-- Compared against uncompiled Python loops to quantify the benefit
-- Documents TPU-specific constraints (float32 requirement for LU decomposition)
+The same solvers reimplemented in JAX, targeting Google TPU. The central question: can JAX's compilation model do what `torch.compile` couldn't?
+
+In an earlier experiment (see `compile_benchmark.py`), `torch.compile` on the full solver loop made things *slower* — because PyTorch's compiler unrolled `range(2773)` into a static graph of 2773 nodes, creating overhead without any parallelism benefit. JAX solves this correctly with `jax.lax.scan`: it compiles the loop body once and drives it via an XLA native `while` loop, eliminating Python overhead without graph explosion.
 
 **Results (CPU, JAX 0.7.2):**
 | Variant | Time | Speedup |
@@ -54,17 +63,22 @@ Re-implements the same solvers in JAX targeting Google TPU. Key focus: `jax.lax.
 | CN — python loop | 83,608 ms | baseline |
 | CN — jit + lax.scan | 4,224 ms | **19.8x** |
 
-The 20x speedup on CN highlights how much Python dispatch overhead dominates when each step is expensive — `lax.scan` eliminates it entirely.
+The 20x speedup on CN is striking. When each time step is expensive (a full linear solve), the Python dispatch overhead accumulated over 2773 steps completely dominates. `lax.scan` eliminates it in one shot. This also hints at why JAX is particularly well-suited for iterative physics solvers — and why TPU, designed around XLA from the ground up, is a natural target for this kind of work.
+
+*Note: TPU requires float32 — LU decomposition is not implemented in float64 on TPU hardware.*
 
 ---
 
-## Key Takeaways
+## Recurring Themes
 
-- Explicit methods GPU-parallelize better than implicit (9.7x vs 2.1x) because matmul scales better than linear solves
-- `torch.compile` on iterative solvers can make things *worse* — dynamo unrolls the full loop into a static graph, creating overhead without any benefit when there is a strict sequential data dependency
-- `jax.lax.scan` is the right solution: compiles the loop body once, drives it natively in XLA
-- TPU requires float32; float64 LU decomposition is not implemented in hardware
+**The numerical method determines the hardware story.** Explicit schemes parallelize beautifully on GPU. Implicit schemes don't — and no amount of compiler optimization changes that. The right question isn't "how do I make my solver faster on GPU?" but "does my solver's structure actually map to what the hardware is good at?"
+
+**`torch.compile` doesn't help iterative solvers — `jax.lax.scan` does.** The sequential data dependency `u_{n+1} = f(u_n)` means no iteration can start before the previous one finishes. Compilers can't parallelize what physics won't allow. What they *can* do is eliminate overhead — and `lax.scan` does this correctly by keeping the compiled graph constant-size regardless of iteration count.
+
+**GPU gives 10x on explicit, 2x on implicit.** If you're designing a simulation pipeline that needs to run fast on accelerators, this is the number to keep in mind.
+
+---
 
 ## Stack
 
-Python · PyTorch · JAX · NumPy · Matplotlib · Google Colab (T4 GPU / TPU)
+Python · PyTorch · JAX · NumPy · Matplotlib · Google Colab (T4 GPU / TPU v2)
